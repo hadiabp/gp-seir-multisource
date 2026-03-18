@@ -30,7 +30,7 @@ STATE_KNOT_DAYS <- 14; STATE_NORDER <- 4
 BETA_KNOT_DAYS <- 28; BETA_NORDER <- 4
 RHO_KNOT_DAYS <- 28; RHO_NORDER <- 4  # NEW: knots for rho(t)
 ETA <- 1e6; KAPPA_BETA <- 1e3; KAPPA_BMAG <- 1e4; BETA_MAX <- 0.6; KAPPA_MASS <- 1e6
-KAPPA_RHO <- 1e2  # roughness penalty on rho(t)
+KAPPA_RHO <- 1  # roughness penalty on rho(t) — must be low to allow variation
 MAX_INNER <- 300; MAX_OUTER <- 40; STEP0 <- 1.0
 bounds <- list(pH=c(0.002,0.05), pICU=c(0.0003,0.02), alphaR=c(0.10,1.00))
 
@@ -381,11 +381,42 @@ if (epiestim_available) {
 
   fwrite(all_rt, "tikz_epiestim.csv")
 
-  # Correlations
+  # Correlations (unshifted)
   ok <- complete.cases(all_rt[, .(rt_rivm, rt_model, rt_cori_mean)])
-  cat(sprintf("  Cori Rt vs RIVM: r=%.3f\n", cor(all_rt$rt_rivm[ok], all_rt$rt_cori_mean[ok])))
+  cat(sprintf("  Cori Rt vs RIVM (unshifted): r=%.3f\n", cor(all_rt$rt_rivm[ok], all_rt$rt_cori_mean[ok])))
   cat(sprintf("  Model Rt vs RIVM: r=%.3f\n", cor(all_rt$rt_rivm[ok], all_rt$rt_model[ok])))
-  cat(sprintf("  Model Rt vs Cori: r=%.3f\n", cor(all_rt$rt_model[ok], all_rt$rt_cori_mean[ok])))
+
+  # Lag analysis: the Cori method applied to reported cases inherits reporting delays.
+  # Following Gostic et al. (2020), we test shifting the Cori estimates backward in time.
+  cat("  Lag analysis (Cori shifted vs RIVM):\n")
+  best_shift <- 0; best_corr <- -1
+  for (shift in -10:0) {
+    rivm_s <- all_rt$rt_rivm[(1-shift):nrow(all_rt)]
+    cori_s <- all_rt$rt_cori_mean[1:(nrow(all_rt)+shift)]
+    ok_s <- is.finite(rivm_s) & is.finite(cori_s)
+    if (sum(ok_s) > 50) {
+      cc <- cor(rivm_s[ok_s], cori_s[ok_s])
+      cat(sprintf("    shift=%+3d days: r=%.3f\n", shift, cc))
+      if (cc > best_corr) { best_corr <- cc; best_shift <- shift }
+    }
+  }
+  cat(sprintf("  Best shift: %+d days, r=%.3f (Model unshifted: %.3f)\n",
+              best_shift, best_corr, cor(all_rt$rt_rivm[ok], all_rt$rt_model[ok])))
+
+  # Also compute with midpoint correction (Gostic et al. recommendation)
+  # Our window is 7 days, so midpoint is t_end - 3
+  rt_cori_mid <- data.table(
+    day = rt_est$R$t_end - 3,  # midpoint of 7-day window
+    rt_cori_mid = rt_est$R$`Mean(R)`
+  )
+  all_rt_mid <- merge(all_rt, rt_cori_mid, by = "day", all.x = TRUE)
+  ok_mid <- complete.cases(all_rt_mid[, .(rt_rivm, rt_cori_mid)])
+  if (sum(ok_mid) > 50) {
+    cat(sprintf("  Cori midpoint-corrected vs RIVM: r=%.3f\n",
+                cor(all_rt_mid$rt_rivm[ok_mid], all_rt_mid$rt_cori_mid[ok_mid])))
+  }
+
+  fwrite(all_rt, "tikz_epiestim.csv")
   cat("  Saved tikz_epiestim.csv\n")
 } else {
   cat("  EpiEstim not installed. Install with: install.packages('EpiEstim')\n")
