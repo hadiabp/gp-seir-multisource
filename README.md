@@ -23,7 +23,7 @@ The four data streams are:
 | ICU admissions | μ_icu = N · p_ICU · γ · I(t) | p_ICU (ICU fraction) |
 | COVID RADAR app (I-fraction) | μ_radar = α_R · I(t) | α_R (app scaling) |
 
-Validation targets (held-out — never used in fitting):
+Validation targets (held-out — not used in fitting):
 - RIVM R_t estimates (Wallinga–Lipsitch method)
 - RIVM prevalence estimates (hospitalisation + seroprevalence)
 
