@@ -41,7 +41,7 @@ gp-seir-multisource/
 │   ├── gp_seir_complete_v2.R         Full-period analysis (primary entry point)
 │   ├── gp_seir_wave_analysis_v2.R    Per-wave independent fits + game theory
 │   └── rolling_shapley_v2.R          Rolling-window Shapley + Banzhaf
-└── python/
+└── Python/
     └── compute_banzhaf.py            Post-hoc Banzhaf from ablation CSVs (stdlib only)
 ```
 
