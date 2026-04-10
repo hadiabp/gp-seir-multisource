@@ -36,6 +36,7 @@ gp-seir-multisource/
 ├── README.md
 ├── LICENSE
 ├── .gitignore
+├── gp_input_final_v2.csv             Main input data file (repository root)
 ├── R/
 │   ├── gp_seir_complete_v2.R         Full-period analysis (primary entry point)
 │   ├── gp_seir_wave_analysis_v2.R    Per-wave independent fits + game theory
