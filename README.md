@@ -150,8 +150,8 @@ Recompute Banzhaf and Shapley values from an existing ablation CSV without re-ru
 
 ```bash
 # Run from the repository root
-python python/compute_banzhaf.py                                  # processes FALSE_ and TRUE_ defaults
-python python/compute_banzhaf.py my_ablation.csv my_output.csv    # custom paths
+python Python/compute_banzhaf.py                                  # processes FALSE_ and TRUE_ defaults
+python Python/compute_banzhaf.py my_ablation.csv my_output.csv    # custom paths
 ```
 
 ---
