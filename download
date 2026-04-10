@@ -1,0 +1,83 @@
+# ── Data files (not committed — obtain separately) ──────────────
+gp_input_final_v2.csv
+data/
+
+# ── All generated output CSVs ────────────────────────────────────
+FALSE_*.csv
+TRUE_*.csv
+wave1_*.csv
+wave2_*.csv
+interwave_*.csv
+cross_wave_*.csv
+rolling_shapley_*.csv
+*_shapley_banzhaf.csv
+*_ablation_results.csv
+*_results.csv
+*_summary.csv
+*_checkpoint.csv
+epi_parameters.csv
+sigma_gamma_sensitivity.csv
+wdata_sensitivity.csv
+beta_init_sensitivity.csv
+leave_one_out.csv
+superadditivity.csv
+stream_fit_metrics.csv
+residual_diagnostics.csv
+cross_correlations.csv
+rt_lag_analysis.csv
+derived_timeseries.csv
+rt_crossings.csv
+ode_compliance.csv
+multistart_params.csv
+multistart_correlation.csv
+
+# ── Generated PDFs ────────────────────────────────────────────────
+*.pdf
+
+# ── R workspace and checkpoint files ─────────────────────────────
+*.RData
+*.rds
+
+# ── R session artifacts ───────────────────────────────────────────
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# ── Python artifacts ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── LaTeX (paper not in repo) ─────────────────────────────────────
+*.tex
+*.bib
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.nav
+*.snm
+*.toc
+*.vrb
+
+# ── OS artifacts ──────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

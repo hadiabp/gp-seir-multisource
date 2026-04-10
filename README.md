@@ -63,7 +63,9 @@ Standard library only — no external packages required.
 
 ## Data
 
-Place `gp_input_final_v2.csv` in the working directory before running any script.
+Place `gp_input_final_v2.csv` in the **repository root** before running any script.
+
+All commands in this README assume you run them from the repository root, so the R scripts can find `gp_input_final_v2.csv` via a relative path.
 
 The file contains daily Dutch COVID-19 surveillance data for the period
 2020-02-27 to 2023-04-01 with the following columns (among others):
@@ -95,13 +97,13 @@ Banzhaf values for 16 characteristic functions, profile likelihoods, sensitivity
 analyses, Cori comparison, and exports 26+ TikZ-ready CSV files.
 
 ```bash
-cd R/
+# Run from the repository root
 
 # Without delay kernels (output prefix: FALSE_)
-Rscript gp_seir_complete_v2.R
+Rscript R/gp_seir_complete_v2.R
 
 # With log-normal reporting delay kernels (output prefix: TRUE_)
-Rscript gp_seir_complete_v2.R --delay
+Rscript R/gp_seir_complete_v2.R --delay
 ```
 
 Typical runtime: 2–4 hours on a modern laptop (15 subsets × 8 starts each).
@@ -115,9 +117,10 @@ Independent fits for each of three epidemic periods
 Produces per-wave Shapley/Banzhaf values, sensitivity analyses, and Cori comparison.
 
 ```bash
-Rscript gp_seir_wave_analysis_v2.R                         # all three waves
-Rscript gp_seir_wave_analysis_v2.R --wave=wave1            # single wave
-Rscript gp_seir_wave_analysis_v2.R --waves=wave1,wave2     # two waves
+# Run from the repository root
+Rscript R/gp_seir_wave_analysis_v2.R                         # all three waves
+Rscript R/gp_seir_wave_analysis_v2.R --wave=wave1            # single wave
+Rscript R/gp_seir_wave_analysis_v2.R --waves=wave1,wave2     # two waves
 ```
 
 Note: `USE_DELAY_KERNEL = TRUE` is hardcoded — the per-wave script always uses delay kernels.
@@ -130,9 +133,10 @@ Sliding-window (W = 5 weeks, S = 1 week step) Shapley and Banzhaf values
 across 48 windows spanning the full year.
 
 ```bash
-Rscript rolling_shapley_v2.R                               # default settings
-Rscript rolling_shapley_v2.R --window=7 --step=2           # wider window
-Rscript rolling_shapley_v2.R --resume                      # resume from checkpoint
+# Run from the repository root
+Rscript R/rolling_shapley_v2.R                               # default settings
+Rscript R/rolling_shapley_v2.R --window=7 --step=2           # wider window
+Rscript R/rolling_shapley_v2.R --resume                      # resume from checkpoint
 ```
 
 Typical runtime: 4–8 hours (48 windows × 15 subsets × 10 starts each).
@@ -144,9 +148,9 @@ Typical runtime: 4–8 hours (48 windows × 15 subsets × 10 starts each).
 Recompute Banzhaf and Shapley values from an existing ablation CSV without re-running R:
 
 ```bash
-cd python/
-python compute_banzhaf.py                                  # processes FALSE_ and TRUE_ defaults
-python compute_banzhaf.py my_ablation.csv my_output.csv    # custom paths
+# Run from the repository root
+python python/compute_banzhaf.py                                  # processes FALSE_ and TRUE_ defaults
+python python/compute_banzhaf.py my_ablation.csv my_output.csv    # custom paths
 ```
 
 ---
