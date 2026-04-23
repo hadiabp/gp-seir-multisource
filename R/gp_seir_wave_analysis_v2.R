@@ -1,0 +1,1391 @@
+#!/usr/bin/env Rscript
+##############################################################################
+# gp_seir_wave_analysis_v2.R
+#
+# Comprehensive per-wave GP-SEIR analysis with Banzhaf values and
+# Cori-method Rt comparison.
+#
+#
+# Usage:
+#   Rscript gp_seir_wave_analysis_v2.R
+#   Rscript gp_seir_wave_analysis_v2.R --wave=wave1
+#
+# Dependencies: data.table, fda, minpack.lm, zoo, EpiEstim (CRAN)
+##############################################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(fda)
+  library(minpack.lm)
+  library(zoo)
+})
+
+# EpiEstim is optional – loaded only for the Cori section
+HAVE_EPIESTIM <- requireNamespace("EpiEstim", quietly = TRUE)
+if (!HAVE_EPIESTIM) {
+  cat("NOTE: EpiEstim not available. Cori-method Rt will be skipped.\n")
+  cat("      Install with: install.packages('EpiEstim')\n\n")
+}
+
+cat("================================================================\n")
+cat("GP-SEIR Wave Analysis v2 – Shapley + Banzhaf + Cori comparison\n")
+cat("================================================================\n\n")
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 1: GLOBAL SETTINGS
+# ═══════════════════════════════════════════════════════════════
+
+DATA_FILE <- "gp_input_final_v2.csv"
+
+N_POP  <- 17400000
+SIGMA  <- 1 / 5.5
+GAMMA  <- 1 / 9.5
+T_GEN  <- 1/SIGMA + 1/GAMMA
+
+STATE_KNOT_DAYS <- 14;  STATE_NORDER <- 4
+BETA_KNOT_DAYS  <- 28;  BETA_NORDER  <- 4
+
+ETA        <- 1e6
+KAPPA_BETA <- 1e3
+KAPPA_BMAG <- 1e4
+BETA_MAX   <- 0.6
+KAPPA_MASS <- 1e6
+
+N_WARM_STARTS  <- 5
+N_COLD_STARTS  <- 3
+MAX_INNER      <- 300
+MAX_OUTER      <- 40
+STEP0          <- 1.0
+BETA_PERTURB   <- 0.30
+PARAM_PERTURB  <- 0.50
+
+USE_DELAY_KERNEL <- TRUE
+DELAY_CASE_MEAN  <- 3.0;  DELAY_CASE_SD <- 1.5
+DELAY_HOSP_MEAN  <- 2.0;  DELAY_HOSP_SD <- 1.0
+DELAY_ICU_MEAN   <- 3.5;  DELAY_ICU_SD  <- 1.5
+DELAY_MAX_LAG    <- 14
+
+BOUNDS <- list(
+  rho    = c(0.05, 0.60),
+  pH     = c(0.002, 0.05),
+  pICU   = c(0.0003, 0.02),
+  alphaR = c(0.10, 1.00)
+)
+
+WAVE_DEFS <- list(
+  wave1 = list(
+    id = 1, label = "Wave 1 (Mar-Jun 2020)", label_short = "wave1",
+    fit_start = as.Date("2020-03-01"), fit_end = as.Date("2020-05-31")
+  ),
+  interwave = list(
+    id = 3, label = "Inter-wave (Jun-Oct 2020)", label_short = "interwave",
+    fit_start = as.Date("2020-06-01"), fit_end = as.Date("2020-10-01")
+  ),
+  wave2 = list(
+    id = 2, label = "Wave 2 (Oct 2020-Mar 2021)", label_short = "wave2",
+    fit_start = as.Date("2020-10-01"), fit_end = as.Date("2021-03-01")
+  )
+)
+ABLATION_WAVES <- c("wave1", "wave2", "interwave")
+
+# Command-line wave selection
+RUN_WAVES <- names(WAVE_DEFS)
+args <- commandArgs(trailingOnly = TRUE)
+for (arg in args) {
+  if (grepl("^--wave=", arg))  RUN_WAVES <- sub("^--wave=", "", arg)
+  if (grepl("^--waves=", arg)) RUN_WAVES <- strsplit(sub("^--waves=", "", arg), ",")[[1]]
+}
+RUN_WAVES <- unique(trimws(RUN_WAVES))
+if (!all(RUN_WAVES %in% names(WAVE_DEFS)))
+  stop("Unknown wave: ", paste(setdiff(RUN_WAVES, names(WAVE_DEFS)), collapse=", "))
+WAVE_DEFS_RUN <- WAVE_DEFS[RUN_WAVES]
+ABLATION_WAVES <- intersect(ABLATION_WAVES, RUN_WAVES)
+
+PROFILE_NPTS <- 15
+SOURCE_NAMES <- c("cases", "hosp", "icu", "radar")
+ALL_SUBSETS <- unlist(lapply(1:4, function(k) combn(SOURCE_NAMES, k, simplify=FALSE)), recursive=FALSE)
+
+# Cori method settings (EpiEstim)
+# COVID-19 serial interval: mean ~5.1 d, SD ~2.8 d (Bi et al. 2020)
+CORI_SI_MEAN <- 5.1
+CORI_SI_SD   <- 2.8
+CORI_TAU     <- 7L   # sliding window width (days)
+
+cat(sprintf("  sigma=1/%.1f, gamma=1/%.1f, T_gen=%.1f days\n", 1/SIGMA, 1/GAMMA, T_GEN))
+cat(sprintf("  USE_DELAY_KERNEL=%s\n", USE_DELAY_KERNEL))
+cat(sprintf("  Waves: %s\n", paste(RUN_WAVES, collapse=", ")))
+cat(sprintf("  %d source subsets\n\n", length(ALL_SUBSETS)))
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 2: HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════
+
+make_delay_kernel <- function(mean_d, sd_d, max_lag = DELAY_MAX_LAG) {
+  if (mean_d <= 0) return(1)
+  lags <- 0:max_lag
+  mu_ln  <- log(mean_d^2 / sqrt(sd_d^2 + mean_d^2))
+  sig_ln <- sqrt(log(1 + sd_d^2 / mean_d^2))
+  w <- dlnorm(lags, mu_ln, sig_ln)
+  w / sum(w)
+}
+
+apply_delay <- function(y, kernel) {
+  klen <- length(kernel)
+  if (klen == 1) return(y)
+  n_y <- length(y)
+  y_conv <- numeric(n_y)
+  for (t_idx in 1:n_y)
+    for (k_idx in 1:klen) {
+      src <- t_idx - (k_idx - 1)
+      if (src >= 1) y_conv[t_idx] <- y_conv[t_idx] + kernel[k_idx] * y[src]
+    }
+  y_conv
+}
+
+to_u   <- function(x, lo, hi) qlogis((x - lo) / (hi - lo))
+from_u <- function(u, lo, hi) lo + (hi - lo) * plogis(u)
+wsd    <- function(y) { s <- sd(y, na.rm=TRUE); if (!is.finite(s)||s<=0) s<-1; 1/s^2 }
+
+seir_rhs <- function(Z, beta, sig=SIGMA, gam=GAMMA)
+  cbind(-beta*exp(Z[,3]),
+        beta*exp(Z[,1]+Z[,3]-Z[,2])-sig,
+        sig*exp(Z[,2]-Z[,3])-gam,
+        gam*exp(Z[,3]-Z[,4]))
+
+make_basis <- function(rng, knot_days, norder) {
+  kn <- unique(c(rng[1], seq(rng[1], rng[2], by=knot_days), rng[2]))
+  create.bspline.basis(rng, length(kn)+norder-2, norder, kn)
+}
+
+subset_to_weights <- function(sources)
+  c(cases=as.numeric("cases"%in%sources), hosp=as.numeric("hosp"%in%sources),
+    icu=as.numeric("icu"%in%sources),   radar=as.numeric("radar"%in%sources))
+
+safe_cor  <- function(x, y, method="pearson") {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) < 5) return(NA_real_)
+  cor(x[ok], y[ok], method=method)
+}
+safe_rmse <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) < 3) return(NA_real_)
+  sqrt(mean((x[ok]-y[ok])^2))
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 3: BANZHAF COMPUTATION
+# ═══════════════════════════════════════════════════════════════
+
+# Compute Shapley values from an ablation data.table
+compute_shapley <- function(abl_dt, metric_col) {
+  n_players <- 4L; phi <- numeric(n_players); names(phi) <- SOURCE_NAMES
+  get_v <- function(src_set) {
+    if (length(src_set)==0) return(0)
+    key <- paste(sort(src_set), collapse="+")
+    row <- abl_dt[sources==key]
+    if (nrow(row)==0) return(NA_real_)
+    row[[metric_col]][1]
+  }
+  for (i in seq_along(SOURCE_NAMES)) {
+    player <- SOURCE_NAMES[i]; others <- SOURCE_NAMES[-i]; total <- 0
+    for (s_size in 0:(n_players-1)) {
+      coalitions <- if (s_size==0) list(character(0)) else combn(others, s_size, simplify=FALSE)
+      weight <- factorial(s_size)*factorial(n_players-s_size-1)/factorial(n_players)
+      for (S in coalitions) {
+        vw <- get_v(c(S, player)); vnw <- get_v(S)
+        if (is.finite(vw) && is.finite(vnw)) total <- total + weight*(vw-vnw)
+      }
+    }
+    phi[i] <- total
+  }
+  phi
+}
+
+# Compute raw Banzhaf values  (equal weight 1/2^(n-1) on all coalitions)
+compute_banzhaf <- function(abl_dt, metric_col) {
+  n_players <- 4L; norm <- 1/(2^(n_players-1))
+  beta <- numeric(n_players); names(beta) <- SOURCE_NAMES
+  get_v <- function(src_set) {
+    if (length(src_set)==0) return(0)
+    key <- paste(sort(src_set), collapse="+")
+    row <- abl_dt[sources==key]
+    if (nrow(row)==0) return(NA_real_)
+    row[[metric_col]][1]
+  }
+  for (i in seq_along(SOURCE_NAMES)) {
+    player <- SOURCE_NAMES[i]; others <- SOURCE_NAMES[-i]; total <- 0
+    for (s_size in 0:(n_players-1)) {
+      coalitions <- if (s_size==0) list(character(0)) else combn(others, s_size, simplify=FALSE)
+      for (S in coalitions) {
+        vw <- get_v(c(S, player)); vnw <- get_v(S)
+        if (is.finite(vw) && is.finite(vnw)) total <- total + (vw-vnw)
+      }
+    }
+    beta[i] <- norm * total
+  }
+  beta
+}
+
+# Normalised Banzhaf: rescale so sum = v(N)
+normalise_banzhaf <- function(beta, vN) {
+  s <- sum(beta)
+  if (abs(s) < 1e-12) return(setNames(rep(0, length(beta)), names(beta)))
+  beta * vN / s
+}
+
+# Shapley interaction index I_ij
+compute_interactions <- function(abl_dt, metric_col) {
+  n_players <- 4L
+  pairs <- combn(SOURCE_NAMES, 2, simplify=FALSE)
+  result <- data.table(source_i=character(0), source_j=character(0), interaction=numeric(0))
+  get_v <- function(src_set) {
+    if (length(src_set)==0) return(0)
+    key <- paste(sort(src_set), collapse="+")
+    row <- abl_dt[sources==key]
+    if (nrow(row)==0) return(NA_real_)
+    row[[metric_col]][1]
+  }
+  for (pair in pairs) {
+    i <- pair[1]; j <- pair[2]; others <- setdiff(SOURCE_NAMES, pair); total <- 0
+    for (s_size in 0:(n_players-2)) {
+      coalitions <- if (s_size==0) list(character(0)) else combn(others, s_size, simplify=FALSE)
+      weight <- factorial(s_size)*factorial(n_players-s_size-2)/factorial(n_players-1)
+      for (S in coalitions) {
+        v_ij <- get_v(c(S,i,j)); v_i <- get_v(c(S,i)); v_j <- get_v(c(S,j)); v_0 <- get_v(S)
+        if (all(is.finite(c(v_ij,v_i,v_j,v_0))))
+          total <- total + weight*(v_ij-v_i-v_j+v_0)
+      }
+    }
+    result <- rbind(result, data.table(source_i=i, source_j=j, interaction=total))
+  }
+  result
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 4: CORI METHOD Rt ESTIMATION
+# ═══════════════════════════════════════════════════════════════
+
+#' Estimate Rt using the Cori (EpiEstim) method on case incidence.
+#'
+#' @param dates  Date vector (daily, no gaps)
+#' @param cases  Daily incidence vector (integer-valued; NAs replaced with 0)
+#' @param si_mean Mean of serial interval (days)
+#' @param si_sd   SD of serial interval (days)
+#' @param tau     Window width in days
+#' @return data.table with columns: date, Rt_cori, Rt_cori_lo, Rt_cori_hi
+cori_rt <- function(dates, cases, si_mean=CORI_SI_MEAN, si_sd=CORI_SI_SD, tau=CORI_TAU) {
+  if (!HAVE_EPIESTIM) return(NULL)
+
+  # EpiEstim requires non-negative integer incidence
+  inc <- pmax(0, round(ifelse(is.finite(cases), cases, 0)))
+
+  config <- EpiEstim::make_config(
+    method = "parametric_si",
+    mean_si = si_mean,
+    std_si  = si_sd,
+    t_start = 2:(length(inc) - tau + 1),
+    t_end   = (tau + 1):length(inc)
+  )
+
+  res <- tryCatch(
+    EpiEstim::estimate_R(inc, method="parametric_si", config=config),
+    error = function(e) { cat("    EpiEstim error:", conditionMessage(e), "\n"); NULL }
+  )
+  if (is.null(res)) return(NULL)
+
+  # EpiEstim reports Rt for window [t_start, t_end]; assign to the END day
+  r_dt <- as.data.table(res$R)
+  r_dt[, date := dates[t_end]]
+  r_dt <- r_dt[, .(date, Rt_cori = `Mean(R)`,
+                   Rt_cori_lo = `Quantile.0.025(R)`,
+                   Rt_cori_hi = `Quantile.0.975(R)`)]
+  r_dt
+}
+
+
+#' Comprehensive comparison between GP-SEIR Rt and Cori Rt
+#' Returns a data.table with merged daily Rt series and agreement statistics.
+compare_rt_methods <- function(fit, cori_dt, wave_label) {
+  if (is.null(cori_dt) || nrow(cori_dt)==0) return(NULL)
+
+  gp_dt <- data.table(date=fit$dates, Rt_gp=fit$main$Rt, Rt_rivm=fit$raw$rt_rivm)
+  merged <- merge(gp_dt, cori_dt, by="date", all.x=TRUE)
+
+  ok_gc <- is.finite(merged$Rt_gp) & is.finite(merged$Rt_cori)
+  ok_gr <- is.finite(merged$Rt_gp) & is.finite(merged$Rt_rivm)
+  ok_cr <- is.finite(merged$Rt_cori) & is.finite(merged$Rt_rivm)
+
+  # Agreement statistics: GP vs Cori
+  stats_gc <- data.table(
+    wave         = wave_label,
+    comparison   = "GP_vs_Cori",
+    pearson      = safe_cor(merged$Rt_gp, merged$Rt_cori),
+    spearman     = safe_cor(merged$Rt_gp, merged$Rt_cori, "spearman"),
+    RMSE         = safe_rmse(merged$Rt_gp, merged$Rt_cori),
+    bias         = if (sum(ok_gc)>3) mean(merged$Rt_gp[ok_gc]-merged$Rt_cori[ok_gc]) else NA,
+    threshold_agree = if (sum(ok_gc)>3)
+      mean((merged$Rt_gp[ok_gc]>1) == (merged$Rt_cori[ok_gc]>1)) else NA,
+    n_days       = sum(ok_gc)
+  )
+
+  # Agreement statistics: Cori vs RIVM
+  stats_cr <- data.table(
+    wave         = wave_label,
+    comparison   = "Cori_vs_RIVM",
+    pearson      = safe_cor(merged$Rt_cori, merged$Rt_rivm),
+    spearman     = safe_cor(merged$Rt_cori, merged$Rt_rivm, "spearman"),
+    RMSE         = safe_rmse(merged$Rt_cori, merged$Rt_rivm),
+    bias         = if (sum(ok_cr)>3) mean(merged$Rt_cori[ok_cr]-merged$Rt_rivm[ok_cr]) else NA,
+    threshold_agree = if (sum(ok_cr)>3)
+      mean((merged$Rt_cori[ok_cr]>1) == (merged$Rt_rivm[ok_cr]>1)) else NA,
+    n_days       = sum(ok_cr)
+  )
+
+  # Agreement statistics: GP vs RIVM
+  stats_gr <- data.table(
+    wave         = wave_label,
+    comparison   = "GP_vs_RIVM",
+    pearson      = safe_cor(merged$Rt_gp, merged$Rt_rivm),
+    spearman     = safe_cor(merged$Rt_gp, merged$Rt_rivm, "spearman"),
+    RMSE         = safe_rmse(merged$Rt_gp, merged$Rt_rivm),
+    bias         = if (sum(ok_gr)>3) mean(merged$Rt_gp[ok_gr]-merged$Rt_rivm[ok_gr]) else NA,
+    threshold_agree = if (sum(ok_gr)>3)
+      mean((merged$Rt_gp[ok_gr]>1) == (merged$Rt_rivm[ok_gr]>1)) else NA,
+    n_days       = sum(ok_gr)
+  )
+
+  # Lag analysis: GP vs Cori
+  lag_rows <- list()
+  for (lag in -14:14) {
+    n <- length(merged$Rt_gp)
+    if (lag >= 0) { idx_g <- 1:(n-lag); idx_c <- (1+lag):n }
+    else          { idx_g <- (1-lag):n; idx_c <- 1:(n+lag) }
+    ok <- is.finite(merged$Rt_gp[idx_g]) & is.finite(merged$Rt_cori[idx_c])
+    if (sum(ok) > 10)
+      lag_rows[[length(lag_rows)+1]] <- data.table(
+        wave=wave_label, lag=lag,
+        pearson=safe_cor(merged$Rt_gp[idx_g][ok], merged$Rt_cori[idx_c][ok]))
+  }
+
+  list(
+    merged   = merged,
+    stats    = rbind(stats_gc, stats_cr, stats_gr),
+    lag      = if (length(lag_rows)>0) rbindlist(lag_rows) else NULL
+  )
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 5: CORE FITTING ENGINE  (unchanged from v1)
+# ═══════════════════════════════════════════════════════════════
+
+fit_gp_seir <- function(df, date_start, date_end,
+                        wc=1, wh=1, wi=1, wr=1,
+                        init_method="hospital", seed=42,
+                        n_warm=N_WARM_STARTS, n_cold=N_COLD_STARTS,
+                        sig=SIGMA, gam=GAMMA,
+                        bounds_override=NULL, fixed_params=NULL,
+                        w_data_scale=1.0, verbose=TRUE) {
+
+  bnds <- if (!is.null(bounds_override)) bounds_override else BOUNDS
+  if (is.null(fixed_params)) fixed_params <- list()
+  fixed_params <- fixed_params[intersect(names(fixed_params), names(BOUNDS))]
+
+  dd <- copy(df)[date >= date_start & date <= date_end][order(date)]
+  n <- nrow(dd)
+  if (n < 30) stop("Too few data points (", n, ") in selected window.")
+  dd[, t := as.numeric(date - date_start)]
+  tv <- dd$t; rng <- range(tv); dt <- 1; dates <- dd$date
+
+  cases_raw  <- as.numeric(dd$cases_raw)
+  hosp_raw   <- as.numeric(dd$hosp_nice)
+  icu_raw    <- as.numeric(dd$icu_daily)
+  radar_frac <- as.numeric(dd$radar_I_frac_sm7)
+  rt_rivm    <- as.numeric(dd$rt_rivm)
+  prev_rivm  <- as.numeric(dd$prev_json_avg)
+
+  y_cases <- log1p(pmax(0, cases_raw))
+  y_hosp  <- log1p(pmax(0, hosp_raw))
+  y_icu   <- log1p(pmax(0, icu_raw))
+  y_radar <- radar_frac
+
+  wb_cases <- wsd(y_cases) * w_data_scale
+  wb_hosp  <- wsd(y_hosp)  * w_data_scale
+  wb_icu   <- wsd(y_icu)   * w_data_scale
+  wb_radar <- wsd(y_radar) * w_data_scale
+
+  Bs  <- make_basis(rng, STATE_KNOT_DAYS, STATE_NORDER)
+  Bb  <- make_basis(rng, BETA_KNOT_DAYS, BETA_NORDER)
+  nbs <- Bs$nbasis; nbb <- Bb$nbasis
+  Ph  <- eval.basis(tv, Bs, 0); dPh <- eval.basis(tv, Bs, 1)
+  Pb  <- eval.basis(tv, Bb, 0); d2Pb <- eval.basis(tv, Bb, 2)
+
+  if (USE_DELAY_KERNEL) {
+    h_case <- make_delay_kernel(DELAY_CASE_MEAN, DELAY_CASE_SD)
+    h_hosp <- make_delay_kernel(DELAY_HOSP_MEAN, DELAY_HOSP_SD)
+    h_icu  <- make_delay_kernel(DELAY_ICU_MEAN,  DELAY_ICU_SD)
+  } else { h_case <- 1; h_hosp <- 1; h_icu <- 1 }
+
+  c0 <- ifelse(is.finite(cases_raw), cases_raw, 0)
+  E0 <- pmax(1e-10, c0/(N_POP*0.20*sig))
+  win_roll <- min(7, max(3, n%/%10))
+  I0 <- as.numeric(rollmean(E0, win_roll, fill=median(E0), align="right"))
+  R0 <- pmin(0.8, cumsum(pmax(c0,0))/N_POP)
+  S0 <- pmax(1e-6, 1-E0-I0-R0)
+  m0 <- S0+E0+I0+R0; S0<-S0/m0; E0<-E0/m0; I0<-I0/m0; R0<-R0/m0
+  Ci <- smooth.basis(tv, cbind(log(S0),log(E0),log(I0),log(R0)),
+                     fdPar(Bs, int2Lfd(2), 1e-4))$fd$coefs
+
+  if (init_method == "hospital") {
+    h0_safe <- ifelse(is.finite(hosp_raw), pmax(0.5, hosp_raw), 0.5)
+    win_h <- min(28, max(7, n%/%5))
+    hosp_sm <- as.numeric(rollmean(h0_safe, win_h, fill=NA, align="center"))
+    hosp_sm[is.na(hosp_sm)] <- hosp_sm[which(!is.na(hosp_sm))[1]]
+    log_hosp <- log(pmax(1, hosp_sm))
+    dlog_h <- c(diff(log_hosp), 0)
+    win_d <- min(21, max(5, n%/%6))
+    dlog_sm <- as.numeric(rollmean(dlog_h, win_d, fill=0, align="center"))
+    dlog_sm[is.na(dlog_sm)] <- 0
+    Tc <- 1/sig+1/gam
+    b0 <- gam*(1+dlog_sm*Tc)
+    b0 <- pmax(0.05, pmin(0.30, b0))
+    win_b <- min(14, max(3, n%/%10))
+    b0 <- as.numeric(rollmean(b0, win_b, fill=NA, align="center"))
+    b0[is.na(b0)] <- median(b0, na.rm=TRUE)
+  } else if (init_method == "constant") {
+    b0 <- rep(gam, n)
+  } else {
+    set.seed(seed+1000)
+    b0 <- runif(n, min=0.05, max=0.25)
+    win_b <- min(14, max(3, n%/%10))
+    b0 <- as.numeric(rollmean(b0, win_b, fill=NA, align="center"))
+    b0[is.na(b0)] <- median(b0, na.rm=TRUE)
+  }
+
+  ai <- as.numeric(smooth.basis(tv, log(pmax(b0,1e-6)),
+                                fdPar(Bb, int2Lfd(2), 1e-2))$fd$coefs)
+  clamp <- function(x,lo,hi) max(lo+1e-8*(hi-lo), min(hi-1e-8*(hi-lo), x))
+  param_idx <- c(rho=nbb+1, pH=nbb+2, pICU=nbb+3, alphaR=nbb+4)
+  fixed_idx <- if (length(fixed_params)>0) unname(param_idx[names(fixed_params)]) else integer(0)
+
+  apply_fixed <- function(th) {
+    th2 <- th
+    for (nm in names(fixed_params)) {
+      lo <- bnds[[nm]][1]; hi <- bnds[[nm]][2]
+      th2[param_idx[nm]] <- to_u(clamp(fixed_params[[nm]],lo,hi), lo, hi)
+    }
+    th2
+  }
+
+  thi <- c(ai,
+           to_u(clamp(0.20,   bnds$rho[1],    bnds$rho[2]),    bnds$rho[1],    bnds$rho[2]),
+           to_u(clamp(0.012,  bnds$pH[1],      bnds$pH[2]),     bnds$pH[1],     bnds$pH[2]),
+           to_u(clamp(0.0025, bnds$pICU[1],    bnds$pICU[2]),   bnds$pICU[1],   bnds$pICU[2]),
+           to_u(clamp(0.40,   bnds$alphaR[1],  bnds$alphaR[2]), bnds$alphaR[1], bnds$alphaR[2]))
+  thi <- apply_fixed(thi)
+  beta_init_curve <- exp(as.numeric(Pb %*% ai))
+  free_scale_idx <- setdiff((nbb+1):(nbb+4), fixed_idx)
+
+  solve_inner <- function(Cs, th, w_c, w_h, w_i, w_r) {
+    av <- th[1:nbb]
+    rho  <- from_u(th[nbb+1], bnds$rho[1],    bnds$rho[2])
+    pH   <- from_u(th[nbb+2], bnds$pH[1],     bnds$pH[2])
+    pICU <- from_u(th[nbb+3], bnds$pICU[1],   bnds$pICU[2])
+    aR   <- from_u(th[nbb+4], bnds$alphaR[1], bnds$alphaR[2])
+    g    <- as.numeric(Pb %*% av); beta <- exp(g)
+    fn <- function(cf) {
+      C <- matrix(cf, nrow=nbs, ncol=4)
+      Z <- Ph%*%C; dZ <- dPh%*%C
+      Sv <- exp(Z[,1]); Ev <- exp(Z[,2]); Iv <- exp(Z[,3]); Rv <- exp(Z[,4])
+      fc <- N_POP*rho*sig*Ev; fh <- N_POP*pH*gam*Iv; fi <- N_POP*pICU*gam*Iv
+      mc <- log1p(pmax(0, apply_delay(fc, h_case)))
+      mh <- log1p(pmax(0, apply_delay(fh, h_hosp)))
+      mi <- log1p(pmax(0, apply_delay(fi, h_icu)))
+      mr <- aR*Iv
+      rc <- sqrt(wb_cases*w_c)*ifelse(is.finite(y_cases), y_cases-mc, 0)
+      rh <- sqrt(wb_hosp*w_h)*ifelse(is.finite(y_hosp),  y_hosp-mh,  0)
+      ri <- sqrt(wb_icu*w_i)*ifelse(is.finite(y_icu),    y_icu-mi,   0)
+      rr <- sqrt(wb_radar*w_r)*ifelse(is.finite(y_radar), y_radar-mr, 0)
+      rp <- sqrt(ETA*dt)*as.numeric(dZ-seir_rhs(Z, beta, sig, gam))
+      rm <- sqrt(KAPPA_MASS)*(Sv+Ev+Iv+Rv-1)
+      rb <- sqrt(KAPPA_BMAG*dt)*pmax(beta-BETA_MAX, 0)
+      rs <- sqrt(KAPPA_BETA*dt)*as.numeric(d2Pb%*%av)
+      c(rc, rh, ri, rr, rp, rm, rb, rs)
+    }
+    r <- nls.lm(par=as.numeric(Cs), fn=fn,
+                control=nls.lm.control(maxiter=MAX_INNER, ftol=1e-10, ptol=1e-10))
+    list(C=matrix(r$par, nrow=nbs, ncol=4), J=sum(r$fvec^2))
+  }
+
+  cascade <- function(th0, C0, w_c, w_h, w_i, w_r) {
+    th <- apply_fixed(th0); Cc <- C0; bJ <- Inf
+    for (oi in 1:MAX_OUTER) {
+      th <- apply_fixed(th)
+      inn <- solve_inner(Cc, th, w_c, w_h, w_i, w_r)
+      Cc <- inn$C; Jc <- inn$J
+      if (Jc < bJ) bJ <- Jc
+      eps <- 1e-4; gr <- numeric(length(th))
+      for (j in seq_along(th)) {
+        if (j %in% fixed_idx) { gr[j] <- 0; next }
+        tp <- th; tp[j] <- tp[j]+eps; tp <- apply_fixed(tp)
+        gr[j] <- (solve_inner(Cc, tp, w_c, w_h, w_i, w_r)$J - Jc)/eps
+      }
+      gn <- sqrt(sum(gr^2))
+      if (gn > 1e-12) {
+        d <- -gr/gn; st <- STEP0; found <- FALSE
+        for (ls in 1:10) {
+          tt <- apply_fixed(th+st*d)
+          it <- solve_inner(Cc, tt, w_c, w_h, w_i, w_r)
+          if (it$J < Jc-1e-4*st*gn) { th <- tt; Cc <- it$C; found <- TRUE; break }
+          st <- st*0.5
+        }
+        if (!found) th <- apply_fixed(th+1e-4*d)
+      }
+      if (gn < 1e-5*max(1, sqrt(sum(th^2)))) break
+    }
+    list(theta=apply_fixed(th), C=Cc, J=bJ)
+  }
+
+  extract_results <- function(res) {
+    th <- res$theta; C <- res$C; av <- th[1:nbb]
+    rho  <- from_u(th[nbb+1], bnds$rho[1],    bnds$rho[2])
+    pH   <- from_u(th[nbb+2], bnds$pH[1],     bnds$pH[2])
+    pICU <- from_u(th[nbb+3], bnds$pICU[1],   bnds$pICU[2])
+    aR   <- from_u(th[nbb+4], bnds$alphaR[1], bnds$alphaR[2])
+    Z <- Ph%*%C; dZ <- dPh%*%C
+    Sv<-exp(Z[,1]); Ev<-exp(Z[,2]); Iv<-exp(Z[,3]); Rv<-exp(Z[,4])
+    beta <- exp(as.numeric(Pb%*%av)); Rt <- beta*Sv/gam
+    mass <- Sv+Ev+Iv+Rv
+    ode_mat <- dZ - seir_rhs(Z, beta, sig, gam)
+    ode_rmse <- sqrt(mean(ode_mat^2))
+    fc <- N_POP*rho*sig*Ev; fh <- N_POP*pH*gam*Iv; fi <- N_POP*pICU*gam*Iv
+    mc <- apply_delay(fc, h_case); mh <- apply_delay(fh, h_hosp); mi <- apply_delay(fi, h_icu)
+    mr <- aR*Iv; I_count <- N_POP*Iv
+    rt_corr_p  <- safe_cor(rt_rivm, Rt)
+    rt_corr_s  <- safe_cor(rt_rivm, Rt, "spearman")
+    rt_rmse_v  <- safe_rmse(rt_rivm, Rt)
+    prev_corr_p <- safe_cor(prev_rivm, I_count)
+    prev_corr_s <- safe_cor(prev_rivm, I_count, "spearman")
+    prev_rmse_v <- safe_rmse(prev_rivm, I_count)
+    ok_rt <- is.finite(rt_rivm) & is.finite(Rt)
+    rt_bias <- if (sum(ok_rt)>3) mean(Rt[ok_rt]-rt_rivm[ok_rt]) else NA_real_
+    threshold_agree <- if (sum(ok_rt)>3) mean((Rt[ok_rt]>1)==(rt_rivm[ok_rt]>1)) else NA_real_
+    # Skill score: 1 - MSE/Var(Rt_RIVM)  (natural zero = naive-mean forecast;
+    # positive = beats naive mean; negative = worse than naive mean)
+    rt_skill <- if (sum(ok_rt)>3) {
+      mse  <- mean((Rt[ok_rt] - rt_rivm[ok_rt])^2)
+      vref <- var(rt_rivm[ok_rt])
+      if (!is.finite(vref) || vref < 1e-12) NA_real_ else 1 - mse/vref
+    } else NA_real_
+    ok_prev <- is.finite(prev_rivm) & is.finite(I_count)
+    prev_skill <- if (sum(ok_prev)>3) {
+      mse  <- mean((I_count[ok_prev] - prev_rivm[ok_prev])^2)
+      vref <- var(prev_rivm[ok_prev])
+      if (!is.finite(vref) || vref < 1e-12) NA_real_ else 1 - mse/vref
+    } else NA_real_
+    denom <- N_POP*sig*Ev; rho_eff <- ifelse(is.finite(cases_raw)&denom>1, cases_raw/denom, NA)
+    resid_cases <- ifelse(is.finite(y_cases), y_cases-log1p(pmax(0,mc)), NA)
+    resid_hosp  <- ifelse(is.finite(y_hosp),  y_hosp -log1p(pmax(0,mh)), NA)
+    resid_icu   <- ifelse(is.finite(y_icu),   y_icu  -log1p(pmax(0,mi)), NA)
+    resid_radar <- ifelse(is.finite(y_radar), y_radar-mr, NA)
+    list(
+      S=Sv, E=Ev, I=Iv, R=Rv, beta=beta, Rt=Rt, mass=mass,
+      mu_cases=mc, mu_hosp=mh, mu_icu=mi, mu_radar=mr,
+      rho=rho, pH=pH, pICU=pICU, alphaR=aR,
+      rt_corr=rt_corr_p, rt_spearman=rt_corr_s, rt_rmse=rt_rmse_v, rt_bias=rt_bias,
+      rt_skill=rt_skill,
+      prev_corr=prev_corr_p, prev_spearman=prev_corr_s, prev_rmse=prev_rmse_v,
+      prev_skill=prev_skill,
+      threshold_agree=threshold_agree,
+      ode_rmse=ode_rmse, cases_rmse=safe_rmse(cases_raw,mc), hosp_rmse=safe_rmse(hosp_raw,mh),
+      mass_err=max(abs(mass-1)),
+      beta_range=c(min(beta),max(beta)), Rt_range=c(min(Rt),max(Rt)),
+      R_end=Rv[n],
+      new_infections=N_POP*beta*Sv*Iv, onset_flow=N_POP*sig*Ev, removal_flow=N_POP*gam*Iv,
+      growth_rate=c(diff(log(pmax(Iv,1e-15))), NA),
+      resid_cases=resid_cases, resid_hosp=resid_hosp,
+      resid_icu=resid_icu, resid_radar=resid_radar,
+      rho_eff=rho_eff,
+      ode_S=ode_mat[,1], ode_E=ode_mat[,2], ode_I=ode_mat[,3], ode_R=ode_mat[,4]
+    )
+  }
+
+  set.seed(seed)
+  best <- NULL; bJ <- Inf; all_results <- list(); all_J <- numeric(0)
+  if (verbose) cat(sprintf("    %d warm + %d cold starts...", n_warm, n_cold))
+  for (s in 1:n_warm) {
+    ts <- thi; Cs <- Ci
+    if (s > 1) {
+      ts[1:nbb] <- ts[1:nbb]+rnorm(nbb,0,BETA_PERTURB)
+      for (k in free_scale_idx) ts[k] <- ts[k]+rnorm(1,0,PARAM_PERTURB)
+      ts <- apply_fixed(ts)
+    }
+    r <- tryCatch(cascade(ts, Cs, wc, wh, wi, wr), error=function(e) NULL)
+    if (!is.null(r)) {
+      all_J <- c(all_J, r$J); all_results[[length(all_results)+1]] <- r
+      if (r$J < bJ) { bJ <- r$J; best <- r }
+    }
+  }
+  for (s in 1:n_cold) {
+    ts <- thi; Cs <- Ci
+    ts[1:nbb] <- ts[1:nbb]+rnorm(nbb,0,0.50)
+    for (k in free_scale_idx) ts[k] <- ts[k]+rnorm(1,0,0.80)
+    ts <- apply_fixed(ts)
+    r <- tryCatch(cascade(ts, Cs, wc, wh, wi, wr), error=function(e) NULL)
+    if (!is.null(r)) {
+      all_J <- c(all_J, r$J); all_results[[length(all_results)+1]] <- r
+      if (r$J < bJ) { bJ <- r$J; best <- r }
+    }
+  }
+  if (is.null(best)) stop("All starts failed.")
+  main <- extract_results(best)
+  if (verbose) cat(sprintf(" J=%.1f | Rt=%.3f | Prev=%.3f\n",
+                            bJ, ifelse(is.na(main$rt_corr),NA,main$rt_corr),
+                            ifelse(is.na(main$prev_corr),NA,main$prev_corr)))
+  multistart_dt <- if (length(all_results)>0) {
+    rbindlist(lapply(seq_along(all_results), function(k) {
+      mk <- extract_results(all_results[[k]])
+      data.table(start=k, J=all_J[k], rho=mk$rho, pH=mk$pH, pICU=mk$pICU, alphaR=mk$alphaR,
+                 rt_corr=mk$rt_corr, prev_corr=mk$prev_corr)
+    }))
+  } else NULL
+  list(dates=dates, tv=tv, n=n, J=bJ, main=main,
+       all_J=all_J, n_converged=sum(all_J<=bJ*1.10),
+       beta_init=beta_init_curve, multistart=multistart_dt,
+       raw=list(cases_raw=cases_raw, hosp_raw=hosp_raw, icu_raw=icu_raw,
+                radar_frac=radar_frac, rt_rivm=rt_rivm, prev_rivm=prev_rivm,
+                y_cases=y_cases, y_hosp=y_hosp, y_icu=y_icu, y_radar=y_radar))
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 6: LOAD DATA
+# ═══════════════════════════════════════════════════════════════
+
+cat("--- Loading data ---\n")
+if (!file.exists(DATA_FILE)) stop("Data file not found: ", DATA_FILE)
+FULL_DF <- fread(DATA_FILE)[, date:=as.Date(date)][order(date)]
+cat(sprintf("  %d rows (%s to %s)\n\n", nrow(FULL_DF), min(FULL_DF$date), max(FULL_DF$date)))
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 7: MAIN FIT PER WAVE
+# ═══════════════════════════════════════════════════════════════
+
+cat("================================================================\n")
+cat("STEP 1: Main fit (all 4 sources) per wave\n")
+cat("================================================================\n")
+
+wave_fits <- list()
+for (wname in RUN_WAVES) {
+  wdef <- WAVE_DEFS[[wname]]
+  cat(sprintf("\n  === %s ===\n", wdef$label))
+  fit <- fit_gp_seir(FULL_DF, wdef$fit_start, wdef$fit_end,
+                     wc=1, wh=1, wi=1, wr=1, init_method="hospital", seed=42+wdef$id)
+  wave_fits[[wname]] <- fit
+
+  p <- wdef$label_short; m <- fit$main
+  results_df <- data.table(
+    date=fit$dates, day=fit$tv,
+    S=m$S, E=m$E, I=m$I, R=m$R,
+    beta_init=fit$beta_init, beta=m$beta,
+    beta_abs_diff=m$beta-fit$beta_init,
+    beta_rel_diff_pct=100*(m$beta-fit$beta_init)/pmax(fit$beta_init,1e-8),
+    Rt_model=m$Rt,
+    mu_cases=m$mu_cases, mu_hosp=m$mu_hosp, mu_icu=m$mu_icu, mu_radar=m$mu_radar,
+    cases_raw=fit$raw$cases_raw, hosp_raw=fit$raw$hosp_raw,
+    icu_raw=fit$raw$icu_raw, radar_frac=fit$raw$radar_frac,
+    rt_rivm=fit$raw$rt_rivm, prev_rivm=fit$raw$prev_rivm,
+    prev_model=N_POP*m$I,
+    rho_eff=m$rho_eff,
+    new_infections=m$new_infections, onset_flow=m$onset_flow, removal_flow=m$removal_flow,
+    growth_rate=m$growth_rate,
+    resid_cases=m$resid_cases, resid_hosp=m$resid_hosp,
+    resid_icu=m$resid_icu, resid_radar=m$resid_radar,
+    ode_S=m$ode_S, ode_E=m$ode_E, ode_I=m$ode_I, ode_R=m$ode_R,
+    mass=m$S+m$E+m$I+m$R
+  )
+  fwrite(results_df, sprintf("%s_results.csv", p))
+  fwrite(results_df[, .(day, cases_raw, mu_cases)], sprintf("%s_tikz_cases.csv", p))
+  fwrite(results_df[, .(day, hosp_raw, mu_hosp)],   sprintf("%s_tikz_hosp.csv", p))
+  fwrite(results_df[, .(day, icu_raw, mu_icu)],     sprintf("%s_tikz_icu.csv", p))
+  fwrite(results_df[, .(day, radar_frac, mu_radar)], sprintf("%s_tikz_radar.csv", p))
+  fwrite(results_df[, .(day, rt_rivm, rt_model=Rt_model)], sprintf("%s_tikz_rt.csv", p))
+  fwrite(results_df[, .(day, prev_rivm, I_model=prev_model)], sprintf("%s_tikz_prev.csv", p))
+  fwrite(results_df[, .(day, S, E, I, R, beta)], sprintf("%s_tikz_seir.csv", p))
+  fwrite(results_df[, .(day, rho_eff, R_pct=R*100)], sprintf("%s_tikz_detection.csv", p))
+  fwrite(results_df[, .(day, beta_init, beta, beta_abs_diff, beta_rel_diff_pct)],
+         sprintf("%s_tikz_beta_init.csv", p))
+  ok_rt <- is.finite(results_df$rt_rivm) & is.finite(results_df$Rt_model)
+  if (any(ok_rt)) {
+    fwrite(results_df[ok_rt, .(rt_rivm, rt_model=Rt_model)], sprintf("%s_tikz_rt_scatter.csv", p))
+    ba_dt <- results_df[ok_rt, .(mean_rt=(Rt_model+rt_rivm)/2, diff_rt=Rt_model-rt_rivm)]
+    ba_bias <- mean(ba_dt$diff_rt); ba_sd <- sd(ba_dt$diff_rt)
+    fwrite(cbind(ba_dt, bias=ba_bias, loa_lo=ba_bias-1.96*ba_sd, loa_hi=ba_bias+1.96*ba_sd),
+           sprintf("%s_tikz_bland_altman.csv", p))
+  }
+  if (!is.null(fit$multistart)) fwrite(fit$multistart, sprintf("%s_multistart_params.csv", p))
+  cat(sprintf("  Saved: %s_results.csv + TikZ CSVs\n", p))
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 8: CORI METHOD Rt COMPARISON
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n================================================================\n")
+cat("STEP 2: Cori-method Rt estimation and comparison\n")
+cat("================================================================\n")
+
+cori_fits <- list()
+cori_stats_all <- list()
+cori_lag_all   <- list()
+
+for (wname in RUN_WAVES) {
+  wdef <- WAVE_DEFS[[wname]]; p <- wdef$label_short
+  fit  <- wave_fits[[wname]]; if (is.null(fit)) next
+
+  cat(sprintf("\n  === %s ===\n", wdef$label))
+
+  if (!HAVE_EPIESTIM) {
+    cat("    Skipped (EpiEstim not installed)\n")
+    next
+  }
+
+  # Use cases in the fitting window
+  dd <- FULL_DF[date >= wdef$fit_start & date <= wdef$fit_end][order(date)]
+  cori_dt <- cori_rt(dd$date, as.numeric(dd$cases_raw))
+
+  if (!is.null(cori_dt) && nrow(cori_dt) > 0) {
+    cori_fits[[wname]] <- cori_dt
+
+    # Save Cori Rt series
+    fwrite(cori_dt, sprintf("%s_cori_rt.csv", p))
+
+    # Three-way comparison: GP-SEIR, Cori, RIVM
+    comp <- compare_rt_methods(fit, cori_dt, wdef$label_short)
+    if (!is.null(comp)) {
+      cori_stats_all[[wname]] <- comp$stats
+      if (!is.null(comp$lag)) cori_lag_all[[wname]] <- comp$lag
+
+      # Merged daily series for TikZ
+      fwrite(comp$merged, sprintf("%s_tikz_rt_threeway.csv", p))
+
+      # Agreement stats
+      fwrite(comp$stats, sprintf("%s_rt_method_comparison.csv", p))
+      if (!is.null(comp$lag)) fwrite(comp$lag, sprintf("%s_rt_lag_gp_cori.csv", p))
+
+      cat(sprintf("    GP vs Cori:  r=%.3f, RMSE=%.3f, bias=%.3f\n",
+                  comp$stats[comparison=="GP_vs_Cori"]$pearson,
+                  comp$stats[comparison=="GP_vs_Cori"]$RMSE,
+                  comp$stats[comparison=="GP_vs_Cori"]$bias))
+      cat(sprintf("    Cori vs RIVM: r=%.3f, RMSE=%.3f, bias=%.3f\n",
+                  comp$stats[comparison=="Cori_vs_RIVM"]$pearson,
+                  comp$stats[comparison=="Cori_vs_RIVM"]$RMSE,
+                  comp$stats[comparison=="Cori_vs_RIVM"]$bias))
+      cat(sprintf("    GP vs RIVM:  r=%.3f, RMSE=%.3f, bias=%.3f\n",
+                  comp$stats[comparison=="GP_vs_RIVM"]$pearson,
+                  comp$stats[comparison=="GP_vs_RIVM"]$RMSE,
+                  comp$stats[comparison=="GP_vs_RIVM"]$bias))
+    }
+  } else {
+    cat("    Cori estimation failed or returned empty results\n")
+  }
+}
+
+# Cross-wave Cori comparison summary
+if (length(cori_stats_all) > 0) {
+  cori_summary <- rbindlist(cori_stats_all)
+  fwrite(cori_summary, "cross_wave_rt_method_comparison.csv")
+  cat("\nSaved: cross_wave_rt_method_comparison.csv\n")
+}
+if (length(cori_lag_all) > 0) {
+  fwrite(rbindlist(cori_lag_all), "cross_wave_rt_lag_gp_cori.csv")
+  cat("Saved: cross_wave_rt_lag_gp_cori.csv\n")
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 9: SOURCE ABLATION (ALL 15 SUBSETS)
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n================================================================\n")
+cat("STEP 3: Source ablation (15 subsets) per wave\n")
+cat("================================================================\n")
+
+ablation_all <- list()
+for (wname in RUN_WAVES) {
+  if (!(wname %in% ABLATION_WAVES)) next
+  wdef <- WAVE_DEFS[[wname]]; p <- wdef$label_short
+  cat(sprintf("\n  === %s ===\n", wdef$label))
+
+  abl_rows <- list(); abl_beta_trajs <- list()
+  for (si in seq_along(ALL_SUBSETS)) {
+    sources <- ALL_SUBSETS[[si]]; src_label <- paste(sources, collapse="+")
+    w <- subset_to_weights(sources)
+    cat(sprintf("    [%2d/15] %s ...", si, src_label))
+    fit <- tryCatch(
+      fit_gp_seir(FULL_DF, wdef$fit_start, wdef$fit_end,
+                  wc=w["cases"], wh=w["hosp"], wi=w["icu"], wr=w["radar"],
+                  seed=100*wdef$id+si, verbose=FALSE),
+      error=function(e) { cat(" FAILED\n"); NULL })
+    if (!is.null(fit)) {
+      m <- fit$main
+      abl_rows[[length(abl_rows)+1]] <- data.table(
+        wave=p, sources=src_label, w_cases=w["cases"], w_hosp=w["hosp"],
+        w_icu=w["icu"], w_radar=w["radar"],
+        J=fit$J, n_converged=fit$n_converged,
+        rho=m$rho, pH=m$pH, pICU=m$pICU, alphaR=m$alphaR,
+        rt_corr=m$rt_corr, rt_spearman=m$rt_spearman,
+        rt_rmse=m$rt_rmse, rt_bias=m$rt_bias, rt_skill=m$rt_skill,
+        prev_corr=m$prev_corr, prev_spearman=m$prev_spearman, prev_skill=m$prev_skill,
+        cases_rmse=m$cases_rmse, ode_rmse=m$ode_rmse,
+        R_end=m$R_end, beta_min=m$beta_range[1], beta_max=m$beta_range[2],
+        rt_min=m$Rt_range[1], rt_max=m$Rt_range[2],
+        threshold_agree=m$threshold_agree,
+        neg_rt_rmse=-m$rt_rmse  # for Shapley with RMSE characteristic function
+      )
+      if (length(sources)==1 || length(sources)==4)
+        abl_beta_trajs[[length(abl_beta_trajs)+1]] <- data.table(
+          day=fit$tv, sources=src_label, beta=m$beta, Rt=m$Rt)
+      cat(sprintf(" J=%.1f Rt=%.3f Prev=%.3f\n", fit$J,
+                  ifelse(is.na(m$rt_corr),NA,m$rt_corr),
+                  ifelse(is.na(m$prev_corr),NA,m$prev_corr)))
+    }
+  }
+
+  abl_dt <- rbindlist(abl_rows)
+  ablation_all[[wname]] <- abl_dt
+  fwrite(abl_dt, sprintf("%s_ablation_results.csv", p))
+  if (length(abl_beta_trajs)>0)
+    fwrite(rbindlist(abl_beta_trajs), sprintf("%s_tikz_beta_ablation.csv", p))
+  # TikZ ablation charts
+  fwrite(abl_dt[order(prev_corr), .(sources, rt_corr, prev_corr, J)],
+         sprintf("%s_tikz_ablation.csv", p))
+  fwrite(abl_dt[order(rt_corr), .(sources, rt_corr, prev_corr, J)],
+         sprintf("%s_tikz_ablation_rt.csv", p))
+  cat(sprintf("  Saved: %s_ablation_results.csv\n", p))
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 10: SHAPLEY AND BANZHAF VALUES
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n================================================================\n")
+cat("STEP 4: Shapley and Banzhaf values per wave\n")
+cat("================================================================\n")
+
+all_game_theory <- list()  # collects combined Shapley + Banzhaf results
+
+for (wname in RUN_WAVES) {
+  wdef <- WAVE_DEFS[[wname]]; p <- wdef$label_short
+  abl_dt <- ablation_all[[wname]]
+  if (is.null(abl_dt) || nrow(abl_dt)==0) next
+  cat(sprintf("\n  === %s ===\n", wdef$label))
+
+  all4 <- abl_dt[sources == paste(sort(SOURCE_NAMES), collapse="+")]
+
+  game_rows <- list()
+  for (col in c("rt_corr", "prev_corr")) {
+    vN <- if (nrow(all4)>0) all4[[col]][1] else NA_real_
+
+    phi  <- compute_shapley(abl_dt, col)
+    beta <- compute_banzhaf(abl_dt, col)
+    nbeta <- normalise_banzhaf(beta, vN)
+
+    for (src in SOURCE_NAMES) {
+      game_rows[[length(game_rows)+1]] <- data.table(
+        wave=p, metric=col, source=src,
+        shapley=phi[src], banzhaf=beta[src], norm_banzhaf=nbeta[src],
+        singleton=abl_dt[sources==src][[col]][1],
+        v_grand=vN
+      )
+    }
+    cat(sprintf("  %s Shapley:      %s\n", col,
+                paste(sprintf("%s=%.3f", SOURCE_NAMES, phi), collapse=", ")))
+    cat(sprintf("  %s normBanzhaf: %s\n", col,
+                paste(sprintf("%s=%.3f", SOURCE_NAMES, nbeta), collapse=", ")))
+    cat(sprintf("  Agreement rank-1: Shapley=%s, Banzhaf=%s %s\n",
+                names(which.max(phi)), names(which.max(nbeta)),
+                if (names(which.max(phi))==names(which.max(nbeta))) "(AGREE)" else "(DIFFER)"))
+  }
+  game_dt <- rbindlist(game_rows)
+  all_game_theory[[wname]] <- game_dt
+  fwrite(game_dt, sprintf("%s_shapley_banzhaf.csv", p))
+
+  # Separate Shapley table (backward compatibility) and Banzhaf TikZ CSVs for figures
+  shap_dt <- dcast(game_dt[metric %in% c("rt_corr","prev_corr")],
+                   wave+source~metric, value.var="shapley")
+  setnames(shap_dt, c("rt_corr","prev_corr"), c("phi_rt","phi_prev"))
+  fwrite(shap_dt, sprintf("%s_shapley_values.csv", p))
+
+  # --- TikZ bar chart CSVs for per-wave Shapley AND Banzhaf figures ---
+  # Format: source, phi_rt, phi_prev, nbeta_rt, nbeta_prev, singleton_rt, singleton_prev
+  # Used by the ybar chart figure in the report.
+  tikz_perwave <- data.table(
+    source   = SOURCE_NAMES,
+    phi_rt   = sapply(SOURCE_NAMES, function(s) game_dt[metric=="rt_corr"   & source==s]$shapley),
+    phi_prev = sapply(SOURCE_NAMES, function(s) game_dt[metric=="prev_corr" & source==s]$shapley),
+    nbeta_rt   = sapply(SOURCE_NAMES, function(s) game_dt[metric=="rt_corr"   & source==s]$norm_banzhaf),
+    nbeta_prev = sapply(SOURCE_NAMES, function(s) game_dt[metric=="prev_corr" & source==s]$norm_banzhaf),
+    singleton_rt   = sapply(SOURCE_NAMES, function(s) game_dt[metric=="rt_corr"   & source==s]$singleton),
+    singleton_prev = sapply(SOURCE_NAMES, function(s) game_dt[metric=="prev_corr" & source==s]$singleton),
+    v_grand_rt   = game_dt[metric=="rt_corr"   & source==SOURCE_NAMES[1]]$v_grand,
+    v_grand_prev = game_dt[metric=="prev_corr" & source==SOURCE_NAMES[1]]$v_grand
+  )
+  fwrite(tikz_perwave, sprintf("%s_tikz_shapley_banzhaf.csv", p))
+
+  # Per-wave TikZ CSVs for Banzhaf bar-chart figure
+  # Wide format: source as rows, phi and norm_banzhaf as columns, for \addplot from pgfplots
+  for (col in c("rt_corr", "prev_corr")) {
+    short <- sub("_corr", "", col)
+    vN <- if (nrow(all4) > 0) all4[[col]][1] else NA_real_
+    phi  <- compute_shapley(abl_dt, col)
+    beta <- compute_banzhaf(abl_dt, col)
+    nbeta <- normalise_banzhaf(beta, vN)
+    tikz_bar <- data.table(
+      source       = SOURCE_NAMES,
+      shapley      = as.numeric(phi),
+      banzhaf_raw  = as.numeric(beta),
+      norm_banzhaf = as.numeric(nbeta),
+      singleton    = sapply(SOURCE_NAMES, function(s) {
+        r <- abl_dt[sources == s]; if (nrow(r) > 0) r[[col]][1] else NA_real_ })
+    )
+    fwrite(tikz_bar, sprintf("%s_tikz_shapley_banzhaf_%s.csv", p, short))
+  }
+  cat(sprintf("    Banzhaf TikZ CSVs: %s_tikz_shapley_banzhaf_rt.csv / _prev.csv\n", p))
+
+  # Interaction indices (Shapley)
+  for (col in c("rt_corr", "prev_corr")) {
+    int_dt <- compute_interactions(abl_dt, col)
+    int_dt[, `:=`(wave=p, metric=col)]
+    fwrite(int_dt, sprintf("%s_shapley_interactions_%s.csv", p, sub("_corr","",col)))
+  }
+  int_rt   <- compute_interactions(abl_dt, "rt_corr")
+  int_prev <- compute_interactions(abl_dt, "prev_corr")
+  fwrite(merge(int_rt, int_prev, by=c("source_i","source_j"), suffixes=c("_rt","_prev")),
+         sprintf("%s_shapley_interactions.csv", p))
+
+  # Leave-one-out
+  if (nrow(all4) > 0) {
+    loo_rows <- lapply(SOURCE_NAMES, function(src) {
+      rem_key <- paste(sort(setdiff(SOURCE_NAMES, src)), collapse="+")
+      row3 <- abl_dt[sources==rem_key]
+      if (nrow(row3)==0) return(NULL)
+      data.table(dropped=src, remaining=rem_key,
+                 rt_all=all4$rt_corr[1], rt_without=row3$rt_corr[1],
+                 rt_drop=all4$rt_corr[1]-row3$rt_corr[1],
+                 prev_all=all4$prev_corr[1], prev_without=row3$prev_corr[1],
+                 prev_drop=all4$prev_corr[1]-row3$prev_corr[1])
+    })
+    loo_dt <- rbindlist(Filter(Negate(is.null), loo_rows))
+    fwrite(loo_dt, sprintf("%s_leave_one_out.csv", p))
+  }
+
+  # Superadditivity / redundancy
+  singles_rt   <- sapply(SOURCE_NAMES, function(s) { r<-abl_dt[sources==s]; if(nrow(r)>0) r$rt_corr[1] else NA })
+  singles_prev <- sapply(SOURCE_NAMES, function(s) { r<-abl_dt[sources==s]; if(nrow(r)>0) r$prev_corr[1] else NA })
+  if (nrow(all4) > 0) {
+    super_dt <- data.table(
+      metric     = c("rt_corr","prev_corr"),
+      v_all      = c(all4$rt_corr[1], all4$prev_corr[1]),
+      sum_singles= c(sum(singles_rt,na.rm=TRUE), sum(singles_prev,na.rm=TRUE)),
+      best_single= c(max(singles_rt,na.rm=TRUE), max(singles_prev,na.rm=TRUE)),
+      best_single_source = c(SOURCE_NAMES[which.max(singles_rt)], SOURCE_NAMES[which.max(singles_prev)]),
+      redundancy = c(1-all4$rt_corr[1]/sum(singles_rt,na.rm=TRUE),
+                     1-all4$prev_corr[1]/sum(singles_prev,na.rm=TRUE))
+    )
+    fwrite(super_dt, sprintf("%s_superadditivity.csv", p))
+  }
+
+  cat(sprintf("  Saved: %s_shapley_banzhaf.csv + interactions + LOO + superadditivity\n", p))
+}
+
+# Cross-wave combined game theory table
+if (length(all_game_theory) > 0) {
+  cross_gt <- rbindlist(all_game_theory)
+  fwrite(cross_gt, "cross_wave_shapley_banzhaf.csv")
+
+  # Summary table like Table 9 (tab:banzhaf) in the report
+  banzhaf_wide <- dcast(cross_gt[metric=="rt_corr"],
+                        wave+source~., value.var=c("shapley","norm_banzhaf"))
+  fwrite(banzhaf_wide, "cross_wave_game_theory_summary.csv")
+  cat("Saved: cross_wave_shapley_banzhaf.csv + cross_wave_game_theory_summary.csv\n")
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 11: SENSITIVITY ANALYSES
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n================================================================\n")
+cat("STEP 5: Sensitivity analyses (init, start-date, sigma/gamma, ODE weight)\n")
+cat("================================================================\n")
+
+# --- 5a. Initialization sensitivity ---
+init_all <- list()
+for (wname in RUN_WAVES) {
+  wdef <- WAVE_DEFS[[wname]]; p <- wdef$label_short
+  cat(sprintf("\n  Init sensitivity: %s\n", wdef$label))
+  rows <- list()
+  for (meth in c("hospital","constant","random_smooth")) {
+    cat(sprintf("    %s ...", meth))
+    fit2 <- if (meth=="hospital" && !is.null(wave_fits[[wname]])) {
+      wave_fits[[wname]]
+    } else {
+      tryCatch(fit_gp_seir(FULL_DF, wdef$fit_start, wdef$fit_end,
+                           init_method=meth, seed=500+wdef$id, verbose=FALSE),
+               error=function(e){ cat(" FAILED\n"); NULL })
+    }
+    if (!is.null(fit2)) {
+      m2 <- fit2$main
+      rows[[length(rows)+1]] <- data.table(
+        wave=p, init=meth, J=fit2$J,
+        rt_corr=m2$rt_corr, prev_corr=m2$prev_corr,
+        rho=m2$rho, pH=m2$pH, pICU=m2$pICU, alphaR=m2$alphaR,
+        beta_median_rel_pct=median(abs(100*(m2$beta-fit2$beta_init)/pmax(fit2$beta_init,1e-8)),na.rm=TRUE)
+      )
+      cat(sprintf(" J=%.1f Rt=%.3f\n", fit2$J, ifelse(is.na(m2$rt_corr),NA,m2$rt_corr)))
+    }
+  }
+  if (length(rows)>0) {
+    init_dt <- rbindlist(rows); init_all[[wname]] <- init_dt
+    fwrite(init_dt, sprintf("%s_init_sensitivity.csv", p))
+  }
+}
+
+# --- 5b. Start-date sensitivity (wave 1 only) ---
+if ("wave1" %in% RUN_WAVES) {
+  cat("\n  Start-date sensitivity: wave1\n")
+  starts <- as.Date(c("2020-03-01", "2020-03-08", "2020-03-15"))
+  sd_rows <- list()
+  
+  for (i in seq_along(starts)) {
+    ds <- starts[i]   # keeps Date class
+    n_days <- as.integer(as.Date("2020-06-30") - ds + 1)
+    cat(sprintf("    start=%s (%d days) ...", as.character(ds), n_days))
+    
+    fit_sd <- tryCatch(
+      fit_gp_seir(FULL_DF, ds, as.Date("2020-06-30"),
+                  init_method = "hospital", seed = 700, verbose = FALSE),
+      error = function(e) { cat(" FAILED\n"); NULL }
+    )
+    
+    if (!is.null(fit_sd)) {
+      m_sd <- fit_sd$main
+      sd_rows[[length(sd_rows) + 1]] <- data.table(
+        start_date   = as.character(ds),
+        offset_days  = as.integer(ds - as.Date("2020-03-01")),
+        n_days       = n_days,
+        J            = fit_sd$J,
+        Jn           = fit_sd$J / n_days,
+        rt_corr      = m_sd$rt_corr,
+        rt_range_lo  = m_sd$Rt_range[1],
+        rt_range_hi  = m_sd$Rt_range[2],
+        n_near_best  = sum(fit_sd$all_J <= fit_sd$J * 1.01),
+        n_total      = length(fit_sd$all_J)
+      )
+      cat(sprintf(" J=%.1f Rt=%.3f\n",
+                  fit_sd$J,
+                  ifelse(is.na(m_sd$rt_corr), NA, m_sd$rt_corr)))
+    }
+  }
+  
+  if (length(sd_rows) > 0) {
+    fwrite(rbindlist(sd_rows), "wave1_start_date_sensitivity.csv")
+  }
+}
+
+# --- 5c. Sigma/gamma sensitivity ---
+cat("\n  Sigma/gamma sensitivity\n")
+sg_configs <- list(
+  list(sig=1/5.5, gam=1/9.5, label="default (1/5.5, 1/9.5)"),
+  list(sig=1/4,   gam=1/9.5, label="sigma=1/4"),
+  list(sig=1/7,   gam=1/9.5, label="sigma=1/7"),
+  list(sig=1/5.5, gam=1/7,   label="gamma=1/7"),
+  list(sig=1/5.5, gam=1/12,  label="gamma=1/12")
+)
+sg_rows <- list()
+for (wname in c("wave1","wave2")[c("wave1","wave2") %in% RUN_WAVES]) {
+  wdef <- WAVE_DEFS[[wname]]
+  for (cfg in sg_configs) {
+    cat(sprintf("    %s %s ...", wdef$label_short, cfg$label))
+    fit_sg <- tryCatch(
+      fit_gp_seir(FULL_DF, wdef$fit_start, wdef$fit_end,
+                  sig=cfg$sig, gam=cfg$gam, seed=500+wdef$id, verbose=FALSE),
+      error=function(e){ cat(" FAILED\n"); NULL })
+    if (!is.null(fit_sg)) {
+      cat(sprintf(" J=%.1f Rt=%.3f\n", fit_sg$J, ifelse(is.na(fit_sg$main$rt_corr),NA,fit_sg$main$rt_corr)))
+      sg_rows[[length(sg_rows)+1]] <- data.table(
+        wave=wdef$label_short, config=cfg$label,
+        sigma=cfg$sig, gamma=cfg$gam,
+        J=fit_sg$J, rt_corr=fit_sg$main$rt_corr, prev_corr=fit_sg$main$prev_corr,
+        rho=fit_sg$main$rho, alphaR=fit_sg$main$alphaR
+      )
+    }
+  }
+}
+if (length(sg_rows)>0) fwrite(rbindlist(sg_rows), "sigma_gamma_sensitivity.csv")
+
+# --- 5d. ODE penalty weight (WDATA) sensitivity ---
+cat("\n  ODE penalty (WDATA) sensitivity\n")
+wdata_vals <- c(0.01, 1, 100, 1e4, 1e6, 1e8)
+wd_rows <- list()
+for (wname in c("wave1","wave2")[c("wave1","wave2") %in% RUN_WAVES]) {
+  wdef <- WAVE_DEFS[[wname]]
+  for (wd in wdata_vals) {
+    cat(sprintf("    %s WDATA=%.2e ...", wdef$label_short, wd))
+    fit_wd <- tryCatch(
+      fit_gp_seir(FULL_DF, wdef$fit_start, wdef$fit_end,
+                  w_data_scale=wd, seed=600+wdef$id, verbose=FALSE),
+      error=function(e){ cat(" FAILED\n"); NULL })
+    if (!is.null(fit_wd)) {
+      cat(sprintf(" J=%.1f Rt=%.3f Prev=%.3f\n", fit_wd$J,
+                  ifelse(is.na(fit_wd$main$rt_corr),NA,fit_wd$main$rt_corr),
+                  ifelse(is.na(fit_wd$main$prev_corr),NA,fit_wd$main$prev_corr)))
+      wd_rows[[length(wd_rows)+1]] <- data.table(
+        wave=wdef$label_short, wdata=wd,
+        J=fit_wd$J, rt_corr=fit_wd$main$rt_corr, prev_corr=fit_wd$main$prev_corr
+      )
+    }
+  }
+}
+if (length(wd_rows)>0) fwrite(rbindlist(wd_rows), "wdata_sensitivity.csv")
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 12: RESIDUAL DIAGNOSTICS
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n================================================================\n")
+cat("STEP 6: Residual diagnostics per wave\n")
+cat("================================================================\n")
+
+for (wname in RUN_WAVES) {
+  wdef <- WAVE_DEFS[[wname]]; p <- wdef$label_short
+  fit <- wave_fits[[wname]]; if (is.null(fit)) next; m <- fit$main
+
+  # TikZ residual / ACF / QQ csvs
+  resid_dt <- data.table(day=fit$tv, date=fit$dates,
+    resid_cases=m$resid_cases, resid_hosp=m$resid_hosp,
+    resid_icu=m$resid_icu, resid_radar=m$resid_radar)
+  fwrite(resid_dt, sprintf("%s_tikz_residuals.csv", p))
+
+  # ACF for cases (wave1 and wave2 for TikZ)
+  for (stream in c("cases","hosp")) {
+    r_vec <- m[[paste0("resid_",stream)]]
+    ok <- is.finite(r_vec)
+    if (sum(ok) > 20) {
+      acf_obj <- acf(r_vec[ok], lag.max=30, plot=FALSE)
+      fwrite(data.table(lag=acf_obj$lag[,,1], acf=acf_obj$acf[,,1]),
+             sprintf("%s_tikz_acf_%s.csv", p, stream))
+    }
+  }
+
+  # QQ plots
+  for (stream in c("cases","hosp")) {
+    r_vec <- m[[paste0("resid_",stream)]]
+    ok <- is.finite(r_vec)
+    if (sum(ok) > 10) {
+      z_scores <- scale(r_vec[ok])[,1]
+      qq <- qqnorm(z_scores, plot.it=FALSE)
+      fwrite(data.table(theoretical=qq$x, sample=qq$y),
+             sprintf("%s_tikz_qq_%s.csv", p, stream))
+    }
+  }
+
+  # Statistical tests
+  tests_rows <- list()
+  for (stream in c("cases","hosp","icu","radar")) {
+    r_vec <- m[[paste0("resid_",stream)]]
+    ok <- is.finite(r_vec)
+    if (sum(ok) < 10) next
+    rv <- r_vec[ok]
+    lb_pval <- tryCatch(Box.test(rv, lag=10, type="Ljung-Box")$p.value, error=function(e) NA)
+    sw_pval <- tryCatch(shapiro.test(rv[seq(1,length(rv),length.out=min(5000,length(rv)))])$p.value,
+                        error=function(e) NA)
+    acf1 <- if (length(rv)>2) acf(rv, lag.max=1, plot=FALSE)$acf[2,,1] else NA
+    tests_rows[[length(tests_rows)+1]] <- data.table(
+      stream=stream, n=sum(ok),
+      ACF1=acf1, LB_pval=lb_pval, SW_pval=sw_pval,
+      kurtosis=if (length(rv)>3) mean((rv-mean(rv))^4)/var(rv)^2 else NA,
+      RMSE=sqrt(mean(rv^2)), MAE=mean(abs(rv)), bias=mean(rv)
+    )
+  }
+  if (length(tests_rows)>0) fwrite(rbindlist(tests_rows), sprintf("%s_residual_tests.csv", p))
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 13: PROFILE LIKELIHOODS
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n================================================================\n")
+cat("STEP 7: Approximate profile likelihoods\n")
+cat("================================================================\n")
+
+for (wname in c("wave1","wave2")[c("wave1","wave2") %in% RUN_WAVES]) {
+  wdef <- WAVE_DEFS[[wname]]; p <- wdef$label_short; fit <- wave_fits[[wname]]
+  if (is.null(fit)) next
+
+  param_specs <- list(
+    list(name="rho",    lo=BOUNDS$rho[1],    hi=BOUNDS$rho[2],    val=fit$main$rho),
+    list(name="pH",     lo=BOUNDS$pH[1],     hi=BOUNDS$pH[2],     val=fit$main$pH),
+    list(name="pICU",   lo=BOUNDS$pICU[1],   hi=BOUNDS$pICU[2],   val=fit$main$pICU),
+    list(name="alphaR", lo=BOUNDS$alphaR[1], hi=BOUNDS$alphaR[2], val=fit$main$alphaR)
+  )
+  for (ps in param_specs) {
+    grid <- seq(ps$lo, ps$hi, length.out=PROFILE_NPTS)
+    grid <- sort(unique(c(grid, ps$val)))
+    prof_rows <- list()
+    cat(sprintf("  %s %s profile (%d pts)...", p, ps$name, length(grid)))
+    for (gv in grid) {
+      fp <- list(); fp[[ps$name]] <- gv
+      fit_p <- tryCatch(fit_gp_seir(FULL_DF, wdef$fit_start, wdef$fit_end,
+                                    fixed_params=fp, seed=42+wdef$id, verbose=FALSE),
+                        error=function(e) NULL)
+      if (!is.null(fit_p))
+        prof_rows[[length(prof_rows)+1]] <- data.table(
+          fixed_value=gv, J=fit_p$J,
+          rt_corr=fit_p$main$rt_corr, prev_corr=fit_p$main$prev_corr)
+    }
+    if (length(prof_rows)>0) {
+      prof_dt <- rbindlist(prof_rows)
+      fwrite(prof_dt, sprintf("%s_tikz_profile_%s.csv", p, ps$name))
+    }
+    cat(" done\n")
+  }
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 14: CROSS-WAVE SUMMARY
+# ═══════════════════════════════════════════════════════════════
+
+cat("\n================================================================\n")
+cat("STEP 8: Cross-wave comparison\n")
+cat("================================================================\n")
+
+comp_rows <- list()
+for (wname in RUN_WAVES) {
+  wdef <- WAVE_DEFS[[wname]]; fit <- wave_fits[[wname]]
+  if (is.null(fit)) next; m <- fit$main
+  comp_rows[[length(comp_rows)+1]] <- data.table(
+    wave=wdef$label_short, wave_label=wdef$label, n_days=fit$n, J=fit$J, Jn=fit$J/fit$n,
+    rho=m$rho, pH=m$pH, pICU=m$pICU, alphaR=m$alphaR,
+    rt_corr=m$rt_corr, rt_spearman=m$rt_spearman, rt_rmse=m$rt_rmse, rt_bias=m$rt_bias,
+    rt_skill=m$rt_skill,
+    prev_corr=m$prev_corr, prev_spearman=m$prev_spearman, prev_rmse=m$prev_rmse,
+    prev_skill=m$prev_skill,
+    rt_min=m$Rt_range[1], rt_max=m$Rt_range[2],
+    R_end=m$R_end, attack_rate_pct=100*m$R_end,
+    peak_I_count=max(N_POP*m$I), peak_I_date=as.character(fit$dates[which.max(m$I)]),
+    ode_rmse=m$ode_rmse, mass_err=m$mass_err,
+    threshold_agree=m$threshold_agree,
+    mean_rho_eff=mean(m$rho_eff, na.rm=TRUE)
+  )
+}
+if (length(comp_rows)>0) {
+  comp_dt <- rbindlist(comp_rows)
+  fwrite(comp_dt, "cross_wave_comparison.csv")
+  cat("Saved: cross_wave_comparison.csv\n")
+  for (i in 1:nrow(comp_dt)) {
+    r <- comp_dt[i]
+    cat(sprintf("  %s: rho=%.3f pH=%.4f alphaR=%.3f | Rt_r=%.3f Prev_r=%.3f att=%.1f%%\n",
+                r$wave, r$rho, r$pH, r$alphaR, r$rt_corr, r$prev_corr, r$attack_rate_pct))
+  }
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 15: EPIDEMIOLOGICAL PARAMETERS + WORKSPACE
+# ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 16: SKILL SCORE AS ALTERNATIVE CHARACTERISTIC FUNCTION
+# ═══════════════════════════════════════════════════════════════
+# The skill score v(S) = 1 - RMSE^2(S) / Var(Rt_RIVM) has a natural zero
+# (a naive mean-forecast has skill = 0) and avoids the negative-value
+# problem of Pearson correlation. We compute Shapley and Banzhaf values
+# under both metrics and compare rankings to assess sensitivity.
+# NOTE: This requires the ablation fits already in ablation_all.
+
+cat("\n================================================================\n")
+cat("STEP 9 (extra): Skill-score characteristic function comparison\n")
+cat("================================================================\n")
+
+skill_game_rows <- list()
+for (wname in RUN_WAVES) {
+  wdef <- WAVE_DEFS[[wname]]; p <- wdef$label_short
+  abl_dt <- ablation_all[[wname]]; if (is.null(abl_dt) || nrow(abl_dt)==0) next
+  fit <- wave_fits[[wname]];         if (is.null(fit)) next
+  
+  # Compute per-subset skill scores from existing ablation fits
+  # Need Var(Rt_RIVM) for the fitting window
+  rt_rivm_w <- fit$raw$rt_rivm
+  vref_rt <- var(rt_rivm_w[is.finite(rt_rivm_w)])
+  prev_rivm_w <- fit$raw$prev_rivm
+  vref_prev <- var(prev_rivm_w[is.finite(prev_rivm_w)])
+
+  # abl_dt already has rt_skill and prev_skill from extraction
+  # Build a synthetic abl_dt for skill score Shapley
+  if (is.finite(vref_rt) && vref_rt > 1e-12 && "rt_skill" %in% names(abl_dt)) {
+    phi_skill_rt  <- compute_shapley(abl_dt, "rt_skill")
+    phi_skill_prev <- compute_shapley(abl_dt, "prev_skill")
+    beta_skill_rt  <- compute_banzhaf(abl_dt, "rt_skill")
+    beta_skill_prev <- compute_banzhaf(abl_dt, "prev_skill")
+    all4_rt   <- abl_dt[sources==paste(sort(SOURCE_NAMES),collapse="+")]
+    vN_rt   <- if(nrow(all4_rt)>0) all4_rt$rt_skill[1]   else NA_real_
+    vN_prev <- if(nrow(all4_rt)>0) all4_rt$prev_skill[1] else NA_real_
+    nb_skill_rt   <- normalise_banzhaf(beta_skill_rt,   vN_rt)
+    nb_skill_prev <- normalise_banzhaf(beta_skill_prev, vN_prev)
+
+    for (src in SOURCE_NAMES) {
+      skill_game_rows[[length(skill_game_rows)+1]] <- data.table(
+        wave=p, source=src,
+        phi_rt_pearson   = all_game_theory[[wname]][metric=="rt_corr"  &source==src]$shapley,
+        phi_rt_skill     = phi_skill_rt[src],
+        nbeta_rt_pearson = all_game_theory[[wname]][metric=="rt_corr"  &source==src]$norm_banzhaf,
+        nbeta_rt_skill   = nb_skill_rt[src],
+        phi_prev_pearson = all_game_theory[[wname]][metric=="prev_corr"&source==src]$shapley,
+        phi_prev_skill   = phi_skill_prev[src],
+        rank_rt_pearson  = rank(-all_game_theory[[wname]][metric=="rt_corr"  ]$shapley)[
+                             which(SOURCE_NAMES==src)],
+        rank_rt_skill    = rank(-phi_skill_rt)[src]
+      )
+    }
+    cat(sprintf("  %s: Shapley rank-1 (Pearson)=%s  (Skill)=%s\n",
+                p, names(which.max(all_game_theory[[wname]][metric=="rt_corr"]$shapley)),
+                names(which.max(phi_skill_rt))))
+  }
+}
+if (length(skill_game_rows)>0) {
+  skill_dt <- rbindlist(skill_game_rows)
+  fwrite(skill_dt, "cross_wave_pearson_vs_skill_shapley.csv")
+  cat("Saved: cross_wave_pearson_vs_skill_shapley.csv\n")
+}
+
+fwrite(data.table(
+  parameter = c("sigma","gamma","gen_time","latent_period","infectious_period","N_pop",
+                "delay_case_mean","delay_case_sd","delay_hosp_mean","delay_hosp_sd",
+                "delay_icu_mean","delay_icu_sd","use_delay_kernel",
+                "eta","kappa_beta","kappa_bmag","beta_max","kappa_mass",
+                "cori_si_mean","cori_si_sd","cori_tau"),
+  value = c(SIGMA, GAMMA, T_GEN, 1/SIGMA, 1/GAMMA, N_POP,
+            DELAY_CASE_MEAN, DELAY_CASE_SD, DELAY_HOSP_MEAN, DELAY_HOSP_SD,
+            DELAY_ICU_MEAN, DELAY_ICU_SD, as.numeric(USE_DELAY_KERNEL),
+            ETA, KAPPA_BETA, KAPPA_BMAG, BETA_MAX, KAPPA_MASS,
+            CORI_SI_MEAN, CORI_SI_SD, CORI_TAU)
+), "epi_parameters_v2.csv")
+
+save.image("gp_seir_wave_workspace_v2.RData")
+
+cat("\n================================================================\n")
+cat("COMPLETE – v2. Output files:\n")
+cat("================================================================\n")
+for (f in sort(list.files(pattern="\\.(csv|pdf|RData)$"))) cat(sprintf("  %s\n", f))
+cat("================================================================\n")
